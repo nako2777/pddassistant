@@ -1,5 +1,12 @@
 // 后台：从页面主世界提取 window.rawData 里的商品数据，推送给管理台
-const DEFAULT_SERVERS = ['http://127.0.0.1:8791', 'http://192.168.3.5:8791'];
+// 自动尝试顺序：同机 → Tailscale（异地/不同局域网，走 tailscale serve）→ 同局域网。
+// 连不上的地址会立刻 connection refused，不会拖慢。
+const DEFAULT_SERVERS = [
+  'http://127.0.0.1:8791',
+  'http://desktop-ooetfht.tail9ddcd0.ts.net:8791',
+  'http://100.72.139.109:8791',
+  'http://192.168.3.5:8791',
+];
 
 // 在页面主世界执行（能读到 window.rawData）
 function extractGoods() {
@@ -55,7 +62,7 @@ async function pushToServer(goods) {
       lastErr = e.message;
     }
   }
-  return { ok: false, err: '连不上管理台（' + lastErr + '）。确认服务在运行，或在插件图标里设置服务器地址' };
+  return { ok: false, err: '连不上管理台（' + lastErr + '）。确认服务在运行，或点插件图标填服务器地址' };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

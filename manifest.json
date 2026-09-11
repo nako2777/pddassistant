@@ -2,14 +2,17 @@
   "manifest_version": 3,
   "name": "煤炉管理台 - 拼多多搬家",
   "description": "在拼多多商品页一键把商品推送到煤炉多账号管理台（自动翻译定价，发布到煤炉/雅虎）",
-  "version": "1.0",
+  "version": "1.1",
   "permissions": ["scripting", "storage"],
   "host_permissions": [
     "https://mobile.yangkeduo.com/*",
     "https://mobile.pinduoduo.com/*",
     "http://127.0.0.1:8791/*",
-    "http://192.168.3.5:8791/*"
+    "http://192.168.3.5:8791/*",
+    "http://100.72.139.109:8791/*",
+    "http://desktop-ooetfht.tail9ddcd0.ts.net:8791/*"
   ],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [{
     "matches": ["https://mobile.yangkeduo.com/*", "https://mobile.pinduoduo.com/*"],

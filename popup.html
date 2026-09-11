@@ -1,15 +1,26 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
-  body { font-family: sans-serif; width: 300px; padding: 12px; }
+  body { font-family: sans-serif; width: 330px; padding: 12px; }
   input { width: 100%; padding: 6px; box-sizing: border-box; margin: 6px 0; }
   button { background: #e05d44; color: #fff; border: none; border-radius: 6px;
            padding: 7px 16px; cursor: pointer; }
-  .dim { color: #888; font-size: 12px; line-height: 1.6; }
+  button.sec { background: #fff; color: #555; border: 1px solid #ccc; }
+  .dim { color: #888; font-size: 12px; line-height: 1.6; margin-top: 8px; }
+  #msg { font-size: 12px; margin-top: 8px; min-height: 16px; }
+  .ok { color: #2e7d32; } .bad { color: #c0392b; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
 </style></head><body>
   <b>管理台服务器地址</b>
-  <input id="server" placeholder="http://192.168.3.5:8791">
-  <button id="save">保存</button> <span id="ok" style="color:#2e7d32"></span>
-  <div class="dim">留空则自动尝试 127.0.0.1:8791 和 192.168.3.5:8791。<br>
-  用法：打开拼多多商品页，点右下角「搬到管理台」按钮，然后去管理台「搬家上架」页确认发布。</div>
+  <input id="server" placeholder="留空 = 自动选择">
+  <button id="save">保存</button>
+  <button id="test" class="sec">测试连接</button>
+  <div id="msg"></div>
+  <div class="dim">
+    留空时自动依次尝试：本机 → Tailscale → 局域网。<br>
+    <b>异地（不同局域网）</b>用 Tailscale 地址：<br>
+    <code>http://desktop-ooetfht.tail9ddcd0.ts.net:8791</code><br>
+    两台设备都要登录同一个 Tailscale 账号并保持在线。<br><br>
+    用法：打开拼多多商品页 → 点右下角「搬到管理台」→ 去管理台「搬家上架」页确认发布。
+  </div>
   <script src="popup.js"></script>
 </body></html>
