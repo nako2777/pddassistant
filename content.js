@@ -22,14 +22,22 @@
           btn.textContent = '✓ 已进采集箱';
           btn.style.background = '#2e7d32';
         } else {
-          btn.textContent = '✗ ' + ((res && res.err) || '失败').slice(0, 24);
+          const err = (res && res.err) || '失败';
+          btn.textContent = '✗ ' + err.slice(0, 60);
+          btn.title = err;            // 悬停看完整信息
           btn.style.background = '#8d6e63';
+          btn.style.maxWidth = '340px';
+          btn.style.whiteSpace = 'normal';
+          console.warn('[搬到管理台] 推送失败:', err);
         }
         setTimeout(() => {
           if (!btn) return;
           btn.textContent = '搬到管理台';
           btn.style.background = '#e05d44';
-        }, 3500);
+          btn.title = '';
+          btn.style.maxWidth = '';
+          btn.style.whiteSpace = 'nowrap';
+        }, 8000);
       });
     };
     document.body.appendChild(btn);

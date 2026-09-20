@@ -6,11 +6,11 @@
            padding: 7px 16px; cursor: pointer; }
   button.sec { background: #fff; color: #555; border: 1px solid #ccc; }
   .dim { color: #888; font-size: 12px; line-height: 1.6; margin-top: 8px; }
-  #msg { font-size: 12px; margin-top: 8px; min-height: 16px; }
+  #msg { font-size: 11px; margin-top: 8px; min-height: 16px; word-break: break-all; }
   .ok { color: #2e7d32; } .bad { color: #c0392b; }
   code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
 </style></head><body>
-  <b>管理台服务器地址</b>
+  <b>管理台服务器地址</b> <span id="ver" style="color:#888;font-size:11px"></span>
   <input id="server" placeholder="留空 = 自动选择">
   <button id="save">保存</button>
   <button id="test" class="sec">测试连接</button>

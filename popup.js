@@ -39,15 +39,29 @@ $('save').onclick = async () => {
 
 $('test').onclick = async () => {
   const custom = normalize($('server').value);
-  const list = custom ? [custom, ...AUTO] : AUTO;
+  const list = [...new Set([custom, ...AUTO].filter(Boolean))];
   say('测试中…');
-  for (const base of list) {
+  // 并发测，逐个报结果，一眼看出是哪条路不通
+  const lines = await Promise.all(list.map(async base => {
     try {
       const n = await probe(base);
-      say(`✓ 连通：${base}（${n} 个账号）`, 'ok');
-      return;
-    } catch (e) { /* 换下一个 */ }
-  }
-  say('✗ 都连不上。确认管理台在运行、Tailscale 两端在线；'
-      + '自定义地址记得先点「保存」授权', 'bad');
+      return { base, txt: `✓ ${base}（${n} 个账号）`, ok: true };
+    } catch (e) {
+      const m = String(e.message || e);
+      const why = /timed out|aborted/i.test(m) ? '超时'
+        : /Failed to fetch|NetworkError/i.test(m) ? '不可达（没权限或网络不通）' : m.slice(0, 24);
+      return { base, txt: `✗ ${base} — ${why}`, ok: false };
+    }
+  }));
+  const good = lines.find(l => l.ok);
+  $('msg').innerHTML = lines.map(l =>
+    `<div class="${l.ok ? 'ok' : 'bad'}">${l.txt}</div>`).join('');
+  if (good) await chrome.storage.local.set({ lastGood: good.base });
 };
+
+// 显示当前版本，方便确认有没有加载到最新代码
+document.addEventListener('DOMContentLoaded', () => {
+  const v = chrome.runtime.getManifest().version;
+  const el = document.getElementById('ver');
+  if (el) el.textContent = 'v' + v;
+});

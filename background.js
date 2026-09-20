@@ -44,25 +44,65 @@ function extractGoods() {
   }
 }
 
-async function pushToServer(goods) {
-  const cfg = await chrome.storage.local.get('server');
-  const servers = cfg.server ? [cfg.server, ...DEFAULT_SERVERS] : DEFAULT_SERVERS;
-  let lastErr = '';
-  for (const base of [...new Set(servers)]) {
-    try {
-      const r = await fetch(base + '/api', {
-        method: 'POST',
-        body: JSON.stringify({ action: 'pdd_push', goods }),
-        signal: AbortSignal.timeout(6000),
-      });
-      const j = await r.json();
-      if (j.ok) return { ok: true, server: base };
-      lastErr = j.error || 'server error';
-    } catch (e) {
-      lastErr = e.message;
-    }
+const PROBE_TIMEOUT = 5000;
+const PUSH_TIMEOUT = 20000;
+
+// 选一个能用的管理台地址：并发探测，谁先通用谁，并记住下次直接用。
+// 记住的地址失效时会自动重新选，所以换网络（家里/异地）不用手动改。
+async function pickServer(diag) {
+  const cfg = await chrome.storage.local.get(['server', 'lastGood']);
+  const candidates = [...new Set([cfg.server, cfg.lastGood, ...DEFAULT_SERVERS]
+    .filter(Boolean))];
+  const probes = candidates.map(base =>
+    fetch(base + '/api/state', { signal: AbortSignal.timeout(PROBE_TIMEOUT) })
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return base;
+      })
+      .catch(e => {
+        diag.push(short(base) + '=' + reason(e));
+        throw e;
+      }));
+  try {
+    const good = await Promise.any(probes);
+    await chrome.storage.local.set({ lastGood: good });
+    return good;
+  } catch {
+    return null;
   }
-  return { ok: false, err: '连不上管理台（' + lastErr + '）。确认服务在运行，或点插件图标填服务器地址' };
+}
+
+function short(base) {
+  return base.replace(/^https?:\/\//, '').replace(/:8791$/, '')
+    .replace(/\.tail\w+\.ts\.net$/, '(tailscale)');
+}
+
+function reason(e) {
+  const m = String(e && e.message || e);
+  if (/timed out|aborted/i.test(m)) return '超时';
+  if (/Failed to fetch|NetworkError/i.test(m)) return '不可达';
+  return m.slice(0, 20);
+}
+
+async function pushToServer(goods) {
+  const diag = [];
+  const base = await pickServer(diag);
+  if (!base) {
+    return { ok: false, err: '连不上管理台 [' + diag.join(' ') + ']' };
+  }
+  try {
+    const r = await fetch(base + '/api', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'pdd_push', goods }),
+      signal: AbortSignal.timeout(PUSH_TIMEOUT),
+    });
+    const j = await r.json();
+    if (j.ok) return { ok: true, server: base };
+    return { ok: false, err: '管理台拒绝: ' + (j.error || '未知') };
+  } catch (e) {
+    await chrome.storage.local.remove('lastGood');
+    return { ok: false, err: short(base) + ' 推送失败: ' + reason(e) };
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
