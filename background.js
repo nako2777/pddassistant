@@ -32,12 +32,44 @@ function extractGoods() {
         if (u && !gal.includes(u)) gal.push(u);
       }
     }
+    // 多规格商品（款式1/款式2…）：煤炉一个链接只能卖一件，所以每个规格
+    // 要拆成独立商品。拼多多的字段命名各版本不一，这里几种写法都兼容。
+    const rawSkus = g.skus || g.skuList || g.sku_list || [];
+    const specName = (sk) => {
+      const specs = sk.specs || sk.specList || sk.spec_list || [];
+      const parts = [];
+      for (const sp of specs) {
+        const v = sp.spec_value || sp.specValue || sp.value || sp.name;
+        if (v) parts.push(String(v));
+      }
+      return parts.join(' ').trim();
+    };
+    const skuPrice = (sk) => {
+      for (const k of ['groupPrice', 'group_price', 'normalPrice', 'normal_price',
+                       'price', 'skuPrice']) {
+        const v = Number(sk[k]);
+        if (v > 0) return v;
+      }
+      return 0;
+    };
+    const skus = rawSkus.map(sk => ({
+      id: String(sk.skuId || sk.sku_id || sk.id || ''),
+      name: specName(sk),
+      price: skuPrice(sk),
+      img: sk.thumbUrl || sk.thumb_url || sk.image || '',
+      qty: sk.quantity != null ? Number(sk.quantity) : null,
+    })).filter(x => x.id && x.name);
+
     return {
       goodsId: String(g.goodsID || g.goodsId || g.goods_id ||
         (location.href.match(/goods_id=(\d+)/) || [])[1] || ''),
       name: g.goodsName, cents, images: gal.slice(0, 12),
       mall: (init.mall || {}).mallName || '', desc: g.goodsDesc || '',
       url: location.href.slice(0, 200),
+      skus,
+      // 万一字段名对不上，把第一个 sku 的键名带回去，日志里一看便知该怎么改
+      skuShape: rawSkus.length && !skus.length
+        ? Object.keys(rawSkus[0]).slice(0, 25).join(',') : '',
     };
   } catch (e) {
     return { err: 'parse:' + e.message };
