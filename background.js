@@ -160,3 +160,67 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   })();
   return true;  // 异步 sendResponse
 });
+
+
+// ---------------------------------------------------------------- 原链接核查 ----
+// 拼多多不登录时，在售和不存在返回一模一样的壳页面（实测都是 63547 字节），
+// 服务端根本查不出来。而这个扩展跑在你已登录的 Chrome 里，带 cookie 去取
+// 就能拿到真实的 rawData，所以核查这件事只能放在这边做。
+const CHECK_ALARM = 'pdd-linkcheck';
+
+async function checkOne(goodsId) {
+  const r = await fetch(
+    `https://mobile.yangkeduo.com/goods.html?goods_id=${goodsId}`,
+    { credentials: 'include', signal: AbortSignal.timeout(20000) });
+  if (!r.ok) return { alive: null, note: 'HTTP ' + r.status };
+  const html = await r.text();
+  if (/"needLogin"\s*:\s*true/.test(html)) {
+    return { alive: null, note: '拼多多未登录，查不了' };
+  }
+  const m = html.match(/"goodsName"\s*:\s*"([^"]{1,40})/);
+  if (m) return { alive: true, note: m[1].slice(0, 20) };
+  if (/已下架|商品不存在|该商品已停止销售/.test(html)) {
+    return { alive: false, note: '页面显示已下架' };
+  }
+  // 登录了、也没报下架，却读不到商品名 → 多半是真没了
+  return { alive: false, note: '页面上读不到商品信息' };
+}
+
+async function runLinkCheck() {
+  const diag = [];
+  const base = await pickServer(diag);
+  if (!base) return;
+  let items = [];
+  try {
+    const r = await fetch(base + '/api', { method: 'POST',
+      body: JSON.stringify({ action: 'pdd_check_list' }),
+      signal: AbortSignal.timeout(10000) });
+    items = (await r.json()).items || [];
+  } catch { return; }
+  if (!items.length) return;
+  const results = [];
+  for (const it of items.slice(0, 60)) {
+    try {
+      const res = await checkOne(it.goodsId);
+      results.push({ id: it.id, ...res });
+    } catch (e) {
+      results.push({ id: it.id, alive: null, note: String(e.message || e).slice(0, 40) });
+    }
+    await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));  // 别太快
+  }
+  try {
+    await fetch(base + '/api', { method: 'POST',
+      body: JSON.stringify({ action: 'pdd_check_result', results }),
+      signal: AbortSignal.timeout(15000) });
+  } catch {}
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(CHECK_ALARM, { periodInMinutes: 180, delayInMinutes: 2 });
+});
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(CHECK_ALARM, { periodInMinutes: 180, delayInMinutes: 2 });
+});
+chrome.alarms.onAlarm.addListener(a => {
+  if (a.name === CHECK_ALARM) runLinkCheck();
+});
