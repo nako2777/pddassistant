@@ -1,4 +1,4 @@
-// 后台：从页面主世界提取 window.rawData 里的商品数据，推送给管理台
+// 后台：从拼多多商品页取商品数据（逻辑在 extract.js），推送给管理台
 // 自动尝试顺序：同机 → Tailscale（异地/不同局域网，走 tailscale serve）→ 同局域网。
 // 连不上的地址会立刻 connection refused，不会拖慢。
 const DEFAULT_SERVERS = [
@@ -8,199 +8,24 @@ const DEFAULT_SERVERS = [
   'http://192.168.3.5:8791',
 ];
 
-// 在页面主世界执行（能读到 window.rawData）
-async function extractGoods() {
-  try {
-    // ---- 兜底数据源 ----
-    // 有的商品页（实测从搜索结果点进去的就是）渲染完会把 window.rawData 清掉，
-    // 全局变量一个都不剩，但数据还躺在页面的内联 <script> 里。
-    // 从脚本文本里把「xxx = {…}」的 JSON 按括号配平抠出来。
-    // 注意：这里刻意不写任何反斜杠（正则/转义），用 charCode 比较，免得被构建脚本吃掉。
-    const BS = String.fromCharCode(92), QT = String.fromCharCode(34);
-    const cutJson = (text, start) => {
-      let depth = 0, inStr = false, esc = false;
-      for (let i = start; i < text.length; i++) {
-        const ch = text[i];
-        if (inStr) {
-          if (esc) esc = false; else if (ch === BS) esc = true; else if (ch === QT) inStr = false;
-          continue;
-        }
-        if (ch === QT) inStr = true;
-        else if (ch === '{') depth++;
-        else if (ch === '}') {
-          depth--;
-          if (depth === 0) { try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; } }
-        }
-      }
-      return null;
-    };
-    // 找「= {」形式的赋值，最多试前 8 处
-    const objectsIn = (text) => {
-      const out = [];
-      let from = 0;
-      while (out.length < 8) {
-        const eq = text.indexOf('=', from);
-        if (eq < 0) break;
-        let k = eq + 1;
-        while (k < text.length && (text[k] === ' ' || text.charCodeAt(k) === 10 || text.charCodeAt(k) === 13 || text.charCodeAt(k) === 9)) k++;
-        if (text[k] === '{') {
-          const o = cutJson(text, k);
-          if (o) out.push(o);
-        }
-        from = eq + 1;
-      }
-      return out;
-    };
-    const fromText = (text) => {
-      if (!text || text.indexOf('goodsName') < 0) return [];
-      // 先从 rawData 赋值处抠，抠不到再挨个试
-      const at = text.indexOf('rawData');
-      const first = at >= 0 ? objectsIn(text.slice(at)).slice(0, 1) : [];
-      return first.length ? first : objectsIn(text);
-    };
-    const extra = [];
-    const tried = { inlineScripts: 0, inlineHit: 0, refetch: '' };
-    if (!window.rawData) {
-      for (const sc of document.scripts) {
-        const t = sc.textContent || '';
-        if (t.indexOf('goodsName') < 0) continue;
-        tried.inlineScripts++;
-        for (const o of fromText(t)) { extra.push(['内联脚本', o]); tried.inlineHit++; }
-      }
-      // 内联脚本里也没有（单页跳转进来的，HTML 里根本没带数据）：
-      // 在页面自己的上下文里把当前地址重新请求一遍——带着登录 cookie，
-      // 拿到的就是服务端渲染好的完整 HTML。后台 service worker 去抓只会拿到壳页面。
-      if (!extra.length) {
-        try {
-          const r = await fetch(location.href, { credentials: 'include' });
-          tried.refetch = 'HTTP ' + r.status;
-          if (r.ok) {
-            const html = await r.text();
-            tried.refetch += ' ' + html.length + '字' + (html.indexOf('goodsName') >= 0 ? ' 含goodsName' : ' 无goodsName');
-            for (const o of fromText(html)) extra.push(['重新请求页面', o]);
-          }
-        } catch (e) { tried.refetch = '失败:' + e.message; }
-      }
-    }
-    // 拼多多不同页面版本把商品数据塞在不同地方，只认 rawData.store.initDataObj
-    // 会在某些商品页直接扑空（实测有的页面就是这样，页面明明加载好了）。
-    // 先按已知路径挨个试，都不中就在几个根对象里广度搜「带 goodsName 的对象」。
-    const roots = [
-      ['window.rawData.store.initDataObj', window.rawData && window.rawData.store
-        && window.rawData.store.initDataObj],
-      ['window.rawData.initDataObj', window.rawData && window.rawData.initDataObj],
-      ['window.rawData', window.rawData],
-      ['window.__INITIAL_STATE__', window.__INITIAL_STATE__],
-      ['window.__NEXT_DATA__.props.pageProps', window.__NEXT_DATA__
-        && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps],
-      ...extra,
-    ];
-    // 广度搜：找第一个既有 goodsName 又有 goodsID/skus 的对象，同时把它的
-    // 父对象也带出来（mall 信息在父级 initDataObj 上）
-    const dig = (root, maxDepth) => {
-      const seen = new Set();
-      let layer = [{ o: root, parent: null }];
-      for (let d = 0; d <= maxDepth && layer.length; d++) {
-        const next = [];
-        for (const { o, parent } of layer) {
-          if (!o || typeof o !== 'object' || seen.has(o)) continue;
-          seen.add(o);
-          if (o.goodsName && (o.goodsID || o.goodsId || o.goods_id || o.skus)) {
-            return { g: o, init: parent || {} };
-          }
-          for (const k of Object.keys(o)) {
-            const v = o[k];
-            if (v && typeof v === 'object' && !Array.isArray(v)) next.push({ o: v, parent: o });
-          }
-        }
-        layer = next;
-      }
-      return null;
-    };
-    let init = null, g = null, from = '';
-    for (const [label, root] of roots) {
-      if (!root) continue;
-      if (root.goods && root.goods.goodsName) { init = root; g = root.goods; from = label + '.goods'; break; }
-      const hit = dig(root, 6);
-      if (hit) { init = hit.init; g = hit.g; from = label + '（深搜）'; break; }
-    }
-    if (!g || !g.goodsName) {
-      const needLogin = roots.some(([, r]) => r && r.needLogin)
-        || /登录|登錄|log ?in/i.test(String(document.title));
-      // 失败时把现场带回去：页面上到底有哪些全局对象，免得只能靠猜
-      const present = ['rawData', '__INITIAL_STATE__', '__NEXT_DATA__', '_oak_page_id']
-        .filter(k => window[k] != null);
-      return {
-        err: needLogin ? 'need-login' : 'no-data',
-        probe: { globals: present.join(',') || '(一个都没有)',
-                 tried: `内联脚本含goodsName的${tried.inlineScripts}个/抠出${tried.inlineHit}个`
-                   + (tried.refetch ? `，重新请求:${tried.refetch}` : ''),
-                 // 名字像数据仓库的全局变量，万一拼多多又换了名字，一眼能看出来
-                 stores: Object.keys(window).filter(k => /data|state|store|init|props/i.test(k)
-                   && window[k] && typeof window[k] === 'object').slice(0, 10).join(',') || '(无)',
-                 rawDataKeys: window.rawData ? Object.keys(window.rawData).slice(0, 12).join(',') : '',
-                 url: location.href.slice(0, 120), title: String(document.title).slice(0, 40) },
-      };
-    }
-    const cands = ['minOnSaleGroupPrice', 'minGroupPrice', 'minOnSaleNormalPrice',
-                   'minNormalPrice', 'maxOnSaleGroupPrice'];
-    let cents = 0;
-    for (const k of cands) {
-      const v = Number(g[k]);
-      if (v > 0 && (!cents || v < cents)) cents = v;
-    }
-    const gal = [];
-    for (const src of [g.topGallery, g.viewImageData, g.detailGallery]) {
-      if (!Array.isArray(src)) continue;
-      for (const it of src) {
-        const u = typeof it === 'string' ? it : (it && (it.url || it.imgUrl));
-        if (u && !gal.includes(u)) gal.push(u);
-      }
-    }
-    // 多规格商品（款式1/款式2…）：煤炉一个链接只能卖一件，所以每个规格
-    // 要拆成独立商品。拼多多的字段命名各版本不一，这里几种写法都兼容。
-    const rawSkus = g.skus || g.skuList || g.sku_list || [];
-    // 规格要按维度结构化传回去：服装类常见「颜色 × 尺码」两个维度，
-    // 按组合拆会变成几十件（同款刷屏），服务端需要知道哪个维度是尺码才好归并。
-    const specPairs = (sk) => {
-      const specs = sk.specs || sk.specList || sk.spec_list || [];
-      return specs.map(sp => ({
-        k: String(sp.spec_key || sp.specKey || sp.key || '').trim(),
-        v: String(sp.spec_value || sp.specValue || sp.value || sp.name || '').trim(),
-      })).filter(x => x.v);
-    };
-    const specName = (sk) => specPairs(sk).map(x => x.v).join(' ').trim();
-    const skuPrice = (sk) => {
-      for (const k of ['groupPrice', 'group_price', 'normalPrice', 'normal_price',
-                       'price', 'skuPrice']) {
-        const v = Number(sk[k]);
-        if (v > 0) return v;
-      }
-      return 0;
-    };
-    const skus = rawSkus.map(sk => ({
-      id: String(sk.skuId || sk.sku_id || sk.id || ''),
-      name: specName(sk),
-      specs: specPairs(sk),
-      price: skuPrice(sk),
-      img: sk.thumbUrl || sk.thumb_url || sk.image || '',
-      qty: sk.quantity != null ? Number(sk.quantity) : null,
-    })).filter(x => x.id && x.name);
-
-    return {
-      goodsId: String(g.goodsID || g.goodsId || g.goods_id ||
-        (location.href.match(/goods_id=(\d+)/) || [])[1] || ''),
-      name: g.goodsName, cents, images: gal.slice(0, 12),
-      mall: (init.mall || {}).mallName || '', desc: g.goodsDesc || '',
-      url: location.href.slice(0, 200),
-      skus, from,
-      // 万一字段名对不上，把第一个 sku 的键名带回去，日志里一看便知该怎么改
-      skuShape: rawSkus.length && !skus.length
-        ? Object.keys(rawSkus[0]).slice(0, 25).join(',') : '',
-    };
-  } catch (e) {
-    return { err: 'parse:' + e.message };
-  }
+// 在商品页里取数据。真正的逻辑在 extract.js（采集和下架核查共用一份）：
+// 先把文件注入页面主世界，再调它挂出来的 window.__mmPddExtract。
+// 用 files 注入而不是在 manifest 里声明 content script，是为了对已经开着的
+// 旧标签页也生效——装完新版不用挨个刷新页面。
+async function runExtract(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', files: ['extract.js'],
+  });
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN',
+    func: () => {
+      const f = window.__mmPddExtract;
+      if (!f) return { err: 'no-extractor' };
+      try { delete window.__mmPddExtract; } catch (e) {}     // 用完即删，页面上不留痕迹
+      return f();
+    },
+  });
+  return result || { err: 'no-result' };
 }
 
 const PROBE_TIMEOUT = 5000;
@@ -210,8 +35,15 @@ const PUSH_TIMEOUT = 20000;
 // 记住的地址失效时会自动重新选，所以换网络（家里/异地）不用手动改。
 async function pickServer(diag) {
   const cfg = await chrome.storage.local.get(['server', 'lastGood']);
-  const candidates = [...new Set([cfg.server, cfg.lastGood, ...DEFAULT_SERVERS]
-    .filter(Boolean))];
+  const probe1 = base => fetch(base + '/api/state', { signal: AbortSignal.timeout(PROBE_TIMEOUT) })
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return base; });
+  // 自己在设置里填过地址的，先单独试它：并发抢答的话，它会输给碰巧也开着的本机实例
+  if (cfg.server) {
+    try { return await probe1(cfg.server); }
+    catch (e) { diag.push(short(cfg.server) + '=' + reason(e)); }
+  }
+  const candidates = [...new Set([cfg.lastGood, ...DEFAULT_SERVERS]
+    .filter(x => x && x !== cfg.server))];
   const probes = candidates.map(base =>
     fetch(base + '/api/state', { signal: AbortSignal.timeout(PROBE_TIMEOUT) })
       .then(r => {
@@ -268,26 +100,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type !== 'grab') return;
   (async () => {
     try {
-      const [{ result: goods }] = await chrome.scripting.executeScript({
-        target: { tabId: sender.tab.id }, world: 'MAIN', func: extractGoods,
-      });
+      const goods = await runExtract(sender.tab.id);
       if (!goods || goods.err) {
-        const why = { 'need-login': '拼多多没登录', 'no-data': '页面上没读到商品数据' };
+        const why = { 'need-login': '拼多多没登录', 'no-data': '页面上没读到商品数据',
+                      'no-extractor': '取数脚本没注入进去，刷新页面再试',
+                      'price-unit': '价格单位认不准，没推（推上去价格可能差一百倍）' };
         const p = goods && goods.probe;
-        // 页面明明加载好了还是读不到，光说「等加载完再点」没用。
-        // 把现场（页面上有哪些全局对象）一起带出来，才好定位是哪个版本的页面。
-        const detail = p ? `｜页面上有：${p.globals}`
-          + (p.rawDataKeys ? `｜rawData 里：${p.rawDataKeys}` : '')
-          + (p.tried ? `｜${p.tried}` : '')
-          + (p.stores ? `｜疑似数据变量：${p.stores}` : '') : '';
+        // 读不到的时候把现场带出来：找到了什么、试了哪几条路、页面上有哪些像数据的变量。
+        // 靠这个才定位出「纯客户端渲染页 rawData=null」这个病因的。
+        const detail = p ? `｜${p.seen}｜${p.tried}｜疑似数据变量：${p.stores}` : '';
         sendResponse({ ok: false,
           err: (why[goods && goods.err] || (goods && goods.err) || '提取失败') + detail });
+        return;
+      }
+      // 只认数据里明确的下架标记。页面文字里碰巧出现「已下架」不拦——
+      // 人正看着这个页面点的按钮，数据也读全了，没道理替他做主不推。
+      if (goods.offSale) { sendResponse({ ok: false, err: '这个商品已经下架了，不推' }); return; }
+      if (!goods.cents && !(goods.skus || []).some(x => x.price > 0)) {
+        sendResponse({ ok: false, err: '读到了商品但没读到价格，不推了（推上去会按最低价挂）' });
+        return;
+      }
+      if (!goods.images || !goods.images.length) {
+        sendResponse({ ok: false, err: '读到了商品但一张图都没有，不推了（管理台没图会直接丢弃）' });
         return;
       }
       if (!goods.goodsId) { sendResponse({ ok: false, err: '没拿到商品ID' }); return; }
       const pushed = await pushToServer(goods);
       sendResponse(pushed.ok
-        ? { ok: true, msg: `已推送「${goods.name.slice(0, 12)}…」¥${(goods.cents / 100).toFixed(2)}` }
+        ? { ok: true, msg: `已推送「${String(goods.name).slice(0, 12)}…」¥${(goods.cents / 100).toFixed(2)}` }
         : { ok: false, err: pushed.err });
     } catch (e) {
       sendResponse({ ok: false, err: e.message });
@@ -303,44 +143,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // 就能拿到真实的 rawData，所以核查这件事只能放在这边做。
 const CHECK_ALARM = 'pdd-linkcheck';
 
-// 核查一个商品是否还在。**只在有明确证据时才判下架**——
-// 实测普通 fetch 拿到的仍是壳页面（拼多多对非浏览器上下文不给数据），
+// 核查一个商品是否还在。**只在有明确证据、且连续两次结论一致时才判下架**——
+// 误报的代价是给用户发一封「原链接下架了」的假警报邮件，这事已经发生过一次：
 // 早期版本在"读不到商品名"时默认判下架，把三个在售商品全冤枉了。
-// 所以这里开真实标签页读 window.rawData，读不到就老实报 unknown。
+// 取数走 extract.js，跟采集是同一套逻辑（以前这里只认 window.rawData 一条路径，
+// 采集那边适配了新页面它没跟上）。读不到、对不上、没登录，一律老实报 unknown。
 async function checkOne(goodsId) {
   let tab;
   try {
-    tab = await chrome.tabs.create({
-      url: `https://mobile.yangkeduo.com/goods.html?goods_id=${goodsId}`,
-      active: false,
-    });
-    // 等页面把 rawData 填好
+    const url = `https://mobile.yangkeduo.com/goods.html?goods_id=${goodsId}`;
+    try {
+      tab = await chrome.tabs.create({ url, active: false });
+    } catch (e) {
+      // 没有任何窗口开着（Mac 上关掉最后一个窗口、Chrome 还在后台很常见）：自己开一个不抢焦点的
+      const win = await chrome.windows.create({ url, focused: false, state: 'minimized' });
+      tab = win.tabs && win.tabs[0];
+      if (!tab) throw e;
+    }
+    let goneVotes = 0, goneNote = '';
     for (let i = 0; i < 12; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: 'MAIN',
-        func: () => {
-          const s = window.rawData && window.rawData.store;
-          const init = s && s.initDataObj;
-          if (!init) return { state: 'loading' };
-          if (init.needLogin) return { state: 'need-login' };
-          const g = init.goods;
-          if (g && g.goodsName) return { state: 'alive', name: g.goodsName.slice(0, 20) };
-          const txt = (document.body.innerText || '').slice(0, 500);
-          if (/已下架|商品不存在|已售罄|停止销售|该商品已下架/.test(txt)) {
-            return { state: 'gone', note: '页面提示已下架' };
-          }
-          return { state: 'loading' };
-        },
-      });
-      if (!result || result.state === 'loading') continue;
-      if (result.state === 'alive') return { alive: true, note: result.name };
-      if (result.state === 'gone') return { alive: false, note: result.note };
-      if (result.state === 'need-login') {
-        return { alive: null, note: '拼多多未登录，无法核查' };
+      let r;
+      try { r = await runExtract(tab.id); }
+      catch (e) { continue; }            // 页面还没提交导航 / 正在跳转，下一轮再试
+      // 被带去了验证页、登录页之类的地方：地址里的商品号已经不是要查的那个
+      const info = await chrome.tabs.get(tab.id).catch(() => null);
+      if (info && info.url && i >= 3) {
+        let still = false;
+        try {
+          const u = new URL(info.url);
+          still = /\/goods\d*\.html$/.test(u.pathname) && u.searchParams.get('goods_id') === String(goodsId);
+        } catch (e) {}
+        if (!still) return { alive: null, note: '页面被带到了别处（登录/验证页？），无法核查' };
       }
+      if (r.err === 'need-login') return { alive: null, note: '拼多多未登录，无法核查' };
+      if (!r.err && r.goodsId && r.goodsId !== String(goodsId)) continue;   // 不是这件，别信
+      const gone = (!r.err && r.offSale) ? '商品数据里的在售标记为否'
+        : (r.goneText ? '页面提示：' + r.goneText : '');
+      if (gone) {
+        goneVotes++; goneNote = gone;
+        if (goneVotes >= 2) return { alive: false, note: gone };
+        continue;
+      }
+      goneVotes = 0;
+      if (!r.err && r.name) return { alive: true, note: String(r.name).slice(0, 20) };
     }
-    return { alive: null, note: '页面一直没加载出商品数据，无法判断' };
+    return { alive: null, note: goneVotes ? `只有一次迹象显示下架（${goneNote}），不够确定`
+                                          : '页面一直没加载出商品数据，无法判断' };
   } catch (e) {
     return { alive: null, note: String(e.message || e).slice(0, 40) };
   } finally {
@@ -360,21 +209,34 @@ async function runLinkCheck() {
     items = (await r.json()).items || [];
   } catch { return; }
   if (!items.length) return;
-  const results = [];
-  for (const it of items.slice(0, 60)) {
+  // 每 5 件回传一次：60 件要查十几分钟，service worker 中途被回收的话，
+  // 攒到最后一次性回传会把查完的结果全丢掉。
+  let results = [];
+  const flush = async () => {
+    if (!results.length) return;
+    const batch = results; results = [];
     try {
-      const res = await checkOne(it.goodsId);
-      results.push({ id: it.id, ...res });
-    } catch (e) {
-      results.push({ id: it.id, alive: null, note: String(e.message || e).slice(0, 40) });
-    }
+      await fetch(base + '/api', { method: 'POST',
+        body: JSON.stringify({ action: 'pdd_check_result', results: batch }),
+        signal: AbortSignal.timeout(15000) });
+    } catch {}
+  };
+  // 同一个商品拆出来的 20 个款式，原链接是同一个拼多多页面：查一次，结果分给每一行。
+  // 挨个查既占满每轮 60 件的额度，又平白多给拼多多的风控递 19 次把柄。
+  const byGoods = new Map();
+  for (const it of items) {
+    if (!byGoods.has(it.goodsId)) byGoods.set(it.goodsId, []);
+    byGoods.get(it.goodsId).push(it.id);
+  }
+  for (const [goodsId, ids] of [...byGoods].slice(0, 60)) {
+    let res;
+    try { res = await checkOne(goodsId); }
+    catch (e) { res = { alive: null, note: String(e.message || e).slice(0, 40) }; }
+    for (const id of ids) results.push({ id, ...res });
+    if (results.length >= 5) await flush();
     await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));  // 别太快
   }
-  try {
-    await fetch(base + '/api', { method: 'POST',
-      body: JSON.stringify({ action: 'pdd_check_result', results }),
-      signal: AbortSignal.timeout(15000) });
-  } catch {}
+  await flush();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
