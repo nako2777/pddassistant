@@ -312,17 +312,24 @@
       const mallBags = [init.mall, g.mall, init.mall_entrance && init.mall_entrance.mall_data,
                         init.mallEntrance && init.mallEntrance.mallData].filter(Boolean);
       // 下架标记：老页面/接口在商品下架后仍会带着完整的 goods 对象，光看「有商品名」会误判在售
-      const saleFlag = pick(g, ['isOnSale', 'is_onsale', 'is_on_sale', 'isGoodsOnSale', 'is_goods_on_sale']);
+      // 真实页面上的在售标记有好几个（实测：isOnSale=true, isGoodsOnSale=true, status=1），
+      // 任何一个明确为否就算下架；全是「是」才算明确在售
+      const flags = ['isOnSale', 'isGoodsOnSale', 'isOnsale', 'is_onsale', 'is_on_sale', 'is_goods_on_sale']
+        .map(k => g[k]).filter(v => v != null);
+      const isNo = v => v === false || v === 0 || v === '0';
+      const saleFlag = flags.length ? !flags.some(isNo) : undefined;
       return {
         goodsId: str(pick(g, ID) || urlId),
         name: str(pick(g, NAME)), cents, images: gal.slice(0, 20),
         mall: str(mallBags.map(m => m.mallName || m.mall_name).find(Boolean) || ''),
         desc: str(pick(g, ['goodsDesc', 'goods_desc']) || '').slice(0, 4000),
-        url: location.href.slice(0, 200),
+        // 存干净的地址。拼多多会自动往地址栏里加 uin=（账号标识）和一堆来源追踪参数，
+        // 这些没必要跟着商品记录存一辈子，核查下架时也只需要商品号
+        url: location.origin + location.pathname + '?goods_id=' + str(pick(g, ID) || urlId),
         skus, from: best.from,
-        offSale: saleFlag === false || saleFlag === 0 || saleFlag === '0',
+        offSale: saleFlag === false,
         // 数据里明确标着在售，页面文字里碰巧出现「已下架」就不算数
-        goneText: (saleFlag === true || saleFlag === 1 || saleFlag === '1') ? '' : goneText,
+        goneText: saleFlag === true ? '' : (goneText || str(g.statusExplain).slice(0, 20)),
         // 万一规格字段名对不上，把第一个 sku 的键名带回去，日志里一看便知该怎么改。
         // 单规格商品（sku 没有 specs）不算对不上，别误报。
         skuShape: rawSkus.length > 1 && !skus.length ? Object.keys(rawSkus[0]).slice(0, 25).join(',') : '',
