@@ -9,8 +9,79 @@ const DEFAULT_SERVERS = [
 ];
 
 // 在页面主世界执行（能读到 window.rawData）
-function extractGoods() {
+async function extractGoods() {
   try {
+    // ---- 兜底数据源 ----
+    // 有的商品页（实测从搜索结果点进去的就是）渲染完会把 window.rawData 清掉，
+    // 全局变量一个都不剩，但数据还躺在页面的内联 <script> 里。
+    // 从脚本文本里把「xxx = {…}」的 JSON 按括号配平抠出来。
+    // 注意：这里刻意不写任何反斜杠（正则/转义），用 charCode 比较，免得被构建脚本吃掉。
+    const BS = String.fromCharCode(92), QT = String.fromCharCode(34);
+    const cutJson = (text, start) => {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inStr) {
+          if (esc) esc = false; else if (ch === BS) esc = true; else if (ch === QT) inStr = false;
+          continue;
+        }
+        if (ch === QT) inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) { try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; } }
+        }
+      }
+      return null;
+    };
+    // 找「= {」形式的赋值，最多试前 8 处
+    const objectsIn = (text) => {
+      const out = [];
+      let from = 0;
+      while (out.length < 8) {
+        const eq = text.indexOf('=', from);
+        if (eq < 0) break;
+        let k = eq + 1;
+        while (k < text.length && (text[k] === ' ' || text.charCodeAt(k) === 10 || text.charCodeAt(k) === 13 || text.charCodeAt(k) === 9)) k++;
+        if (text[k] === '{') {
+          const o = cutJson(text, k);
+          if (o) out.push(o);
+        }
+        from = eq + 1;
+      }
+      return out;
+    };
+    const fromText = (text) => {
+      if (!text || text.indexOf('goodsName') < 0) return [];
+      // 先从 rawData 赋值处抠，抠不到再挨个试
+      const at = text.indexOf('rawData');
+      const first = at >= 0 ? objectsIn(text.slice(at)).slice(0, 1) : [];
+      return first.length ? first : objectsIn(text);
+    };
+    const extra = [];
+    const tried = { inlineScripts: 0, inlineHit: 0, refetch: '' };
+    if (!window.rawData) {
+      for (const sc of document.scripts) {
+        const t = sc.textContent || '';
+        if (t.indexOf('goodsName') < 0) continue;
+        tried.inlineScripts++;
+        for (const o of fromText(t)) { extra.push(['内联脚本', o]); tried.inlineHit++; }
+      }
+      // 内联脚本里也没有（单页跳转进来的，HTML 里根本没带数据）：
+      // 在页面自己的上下文里把当前地址重新请求一遍——带着登录 cookie，
+      // 拿到的就是服务端渲染好的完整 HTML。后台 service worker 去抓只会拿到壳页面。
+      if (!extra.length) {
+        try {
+          const r = await fetch(location.href, { credentials: 'include' });
+          tried.refetch = 'HTTP ' + r.status;
+          if (r.ok) {
+            const html = await r.text();
+            tried.refetch += ' ' + html.length + '字' + (html.indexOf('goodsName') >= 0 ? ' 含goodsName' : ' 无goodsName');
+            for (const o of fromText(html)) extra.push(['重新请求页面', o]);
+          }
+        } catch (e) { tried.refetch = '失败:' + e.message; }
+      }
+    }
     // 拼多多不同页面版本把商品数据塞在不同地方，只认 rawData.store.initDataObj
     // 会在某些商品页直接扑空（实测有的页面就是这样，页面明明加载好了）。
     // 先按已知路径挨个试，都不中就在几个根对象里广度搜「带 goodsName 的对象」。
@@ -22,6 +93,7 @@ function extractGoods() {
       ['window.__INITIAL_STATE__', window.__INITIAL_STATE__],
       ['window.__NEXT_DATA__.props.pageProps', window.__NEXT_DATA__
         && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps],
+      ...extra,
     ];
     // 广度搜：找第一个既有 goodsName 又有 goodsID/skus 的对象，同时把它的
     // 父对象也带出来（mall 信息在父级 initDataObj 上）
@@ -61,6 +133,11 @@ function extractGoods() {
       return {
         err: needLogin ? 'need-login' : 'no-data',
         probe: { globals: present.join(',') || '(一个都没有)',
+                 tried: `内联脚本含goodsName的${tried.inlineScripts}个/抠出${tried.inlineHit}个`
+                   + (tried.refetch ? `，重新请求:${tried.refetch}` : ''),
+                 // 名字像数据仓库的全局变量，万一拼多多又换了名字，一眼能看出来
+                 stores: Object.keys(window).filter(k => /data|state|store|init|props/i.test(k)
+                   && window[k] && typeof window[k] === 'object').slice(0, 10).join(',') || '(无)',
                  rawDataKeys: window.rawData ? Object.keys(window.rawData).slice(0, 12).join(',') : '',
                  url: location.href.slice(0, 120), title: String(document.title).slice(0, 40) },
       };
@@ -200,7 +277,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 页面明明加载好了还是读不到，光说「等加载完再点」没用。
         // 把现场（页面上有哪些全局对象）一起带出来，才好定位是哪个版本的页面。
         const detail = p ? `｜页面上有：${p.globals}`
-          + (p.rawDataKeys ? `｜rawData 里：${p.rawDataKeys}` : '') : '';
+          + (p.rawDataKeys ? `｜rawData 里：${p.rawDataKeys}` : '')
+          + (p.tried ? `｜${p.tried}` : '')
+          + (p.stores ? `｜疑似数据变量：${p.stores}` : '') : '';
         sendResponse({ ok: false,
           err: (why[goods && goods.err] || (goods && goods.err) || '提取失败') + detail });
         return;
