@@ -35,15 +35,16 @@ function extractGoods() {
     // 多规格商品（款式1/款式2…）：煤炉一个链接只能卖一件，所以每个规格
     // 要拆成独立商品。拼多多的字段命名各版本不一，这里几种写法都兼容。
     const rawSkus = g.skus || g.skuList || g.sku_list || [];
-    const specName = (sk) => {
+    // 规格要按维度结构化传回去：服装类常见「颜色 × 尺码」两个维度，
+    // 按组合拆会变成几十件（同款刷屏），服务端需要知道哪个维度是尺码才好归并。
+    const specPairs = (sk) => {
       const specs = sk.specs || sk.specList || sk.spec_list || [];
-      const parts = [];
-      for (const sp of specs) {
-        const v = sp.spec_value || sp.specValue || sp.value || sp.name;
-        if (v) parts.push(String(v));
-      }
-      return parts.join(' ').trim();
+      return specs.map(sp => ({
+        k: String(sp.spec_key || sp.specKey || sp.key || '').trim(),
+        v: String(sp.spec_value || sp.specValue || sp.value || sp.name || '').trim(),
+      })).filter(x => x.v);
     };
+    const specName = (sk) => specPairs(sk).map(x => x.v).join(' ').trim();
     const skuPrice = (sk) => {
       for (const k of ['groupPrice', 'group_price', 'normalPrice', 'normal_price',
                        'price', 'skuPrice']) {
@@ -55,6 +56,7 @@ function extractGoods() {
     const skus = rawSkus.map(sk => ({
       id: String(sk.skuId || sk.sku_id || sk.id || ''),
       name: specName(sk),
+      specs: specPairs(sk),
       price: skuPrice(sk),
       img: sk.thumbUrl || sk.thumb_url || sk.image || '',
       qty: sk.quantity != null ? Number(sk.quantity) : null,
