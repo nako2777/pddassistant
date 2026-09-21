@@ -11,11 +11,59 @@ const DEFAULT_SERVERS = [
 // 在页面主世界执行（能读到 window.rawData）
 function extractGoods() {
   try {
-    const s = window.rawData && window.rawData.store;
-    const init = s && s.initDataObj;
-    const g = init && init.goods;
+    // 拼多多不同页面版本把商品数据塞在不同地方，只认 rawData.store.initDataObj
+    // 会在某些商品页直接扑空（实测有的页面就是这样，页面明明加载好了）。
+    // 先按已知路径挨个试，都不中就在几个根对象里广度搜「带 goodsName 的对象」。
+    const roots = [
+      ['window.rawData.store.initDataObj', window.rawData && window.rawData.store
+        && window.rawData.store.initDataObj],
+      ['window.rawData.initDataObj', window.rawData && window.rawData.initDataObj],
+      ['window.rawData', window.rawData],
+      ['window.__INITIAL_STATE__', window.__INITIAL_STATE__],
+      ['window.__NEXT_DATA__.props.pageProps', window.__NEXT_DATA__
+        && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps],
+    ];
+    // 广度搜：找第一个既有 goodsName 又有 goodsID/skus 的对象，同时把它的
+    // 父对象也带出来（mall 信息在父级 initDataObj 上）
+    const dig = (root, maxDepth) => {
+      const seen = new Set();
+      let layer = [{ o: root, parent: null }];
+      for (let d = 0; d <= maxDepth && layer.length; d++) {
+        const next = [];
+        for (const { o, parent } of layer) {
+          if (!o || typeof o !== 'object' || seen.has(o)) continue;
+          seen.add(o);
+          if (o.goodsName && (o.goodsID || o.goodsId || o.goods_id || o.skus)) {
+            return { g: o, init: parent || {} };
+          }
+          for (const k of Object.keys(o)) {
+            const v = o[k];
+            if (v && typeof v === 'object' && !Array.isArray(v)) next.push({ o: v, parent: o });
+          }
+        }
+        layer = next;
+      }
+      return null;
+    };
+    let init = null, g = null, from = '';
+    for (const [label, root] of roots) {
+      if (!root) continue;
+      if (root.goods && root.goods.goodsName) { init = root; g = root.goods; from = label + '.goods'; break; }
+      const hit = dig(root, 6);
+      if (hit) { init = hit.init; g = hit.g; from = label + '（深搜）'; break; }
+    }
     if (!g || !g.goodsName) {
-      return { err: init && init.needLogin ? 'need-login' : 'no-data' };
+      const needLogin = roots.some(([, r]) => r && r.needLogin)
+        || /登录|登錄|log ?in/i.test(String(document.title));
+      // 失败时把现场带回去：页面上到底有哪些全局对象，免得只能靠猜
+      const present = ['rawData', '__INITIAL_STATE__', '__NEXT_DATA__', '_oak_page_id']
+        .filter(k => window[k] != null);
+      return {
+        err: needLogin ? 'need-login' : 'no-data',
+        probe: { globals: present.join(',') || '(一个都没有)',
+                 rawDataKeys: window.rawData ? Object.keys(window.rawData).slice(0, 12).join(',') : '',
+                 url: location.href.slice(0, 120), title: String(document.title).slice(0, 40) },
+      };
     }
     const cands = ['minOnSaleGroupPrice', 'minGroupPrice', 'minOnSaleNormalPrice',
                    'minNormalPrice', 'maxOnSaleGroupPrice'];
@@ -68,7 +116,7 @@ function extractGoods() {
       name: g.goodsName, cents, images: gal.slice(0, 12),
       mall: (init.mall || {}).mallName || '', desc: g.goodsDesc || '',
       url: location.href.slice(0, 200),
-      skus,
+      skus, from,
       // 万一字段名对不上，把第一个 sku 的键名带回去，日志里一看便知该怎么改
       skuShape: rawSkus.length && !skus.length
         ? Object.keys(rawSkus[0]).slice(0, 25).join(',') : '',
@@ -147,8 +195,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         target: { tabId: sender.tab.id }, world: 'MAIN', func: extractGoods,
       });
       if (!goods || goods.err) {
-        const why = { 'need-login': '拼多多没登录', 'no-data': '页面上没读到商品数据（等页面加载完再点）' };
-        sendResponse({ ok: false, err: why[goods && goods.err] || (goods && goods.err) || '提取失败' });
+        const why = { 'need-login': '拼多多没登录', 'no-data': '页面上没读到商品数据' };
+        const p = goods && goods.probe;
+        // 页面明明加载好了还是读不到，光说「等加载完再点」没用。
+        // 把现场（页面上有哪些全局对象）一起带出来，才好定位是哪个版本的页面。
+        const detail = p ? `｜页面上有：${p.globals}`
+          + (p.rawDataKeys ? `｜rawData 里：${p.rawDataKeys}` : '') : '';
+        sendResponse({ ok: false,
+          err: (why[goods && goods.err] || (goods && goods.err) || '提取失败') + detail });
         return;
       }
       if (!goods.goodsId) { sendResponse({ ok: false, err: '没拿到商品ID' }); return; }
@@ -170,22 +224,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // 就能拿到真实的 rawData，所以核查这件事只能放在这边做。
 const CHECK_ALARM = 'pdd-linkcheck';
 
+// 核查一个商品是否还在。**只在有明确证据时才判下架**——
+// 实测普通 fetch 拿到的仍是壳页面（拼多多对非浏览器上下文不给数据），
+// 早期版本在"读不到商品名"时默认判下架，把三个在售商品全冤枉了。
+// 所以这里开真实标签页读 window.rawData，读不到就老实报 unknown。
 async function checkOne(goodsId) {
-  const r = await fetch(
-    `https://mobile.yangkeduo.com/goods.html?goods_id=${goodsId}`,
-    { credentials: 'include', signal: AbortSignal.timeout(20000) });
-  if (!r.ok) return { alive: null, note: 'HTTP ' + r.status };
-  const html = await r.text();
-  if (/"needLogin"\s*:\s*true/.test(html)) {
-    return { alive: null, note: '拼多多未登录，查不了' };
+  let tab;
+  try {
+    tab = await chrome.tabs.create({
+      url: `https://mobile.yangkeduo.com/goods.html?goods_id=${goodsId}`,
+      active: false,
+    });
+    // 等页面把 rawData 填好
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        func: () => {
+          const s = window.rawData && window.rawData.store;
+          const init = s && s.initDataObj;
+          if (!init) return { state: 'loading' };
+          if (init.needLogin) return { state: 'need-login' };
+          const g = init.goods;
+          if (g && g.goodsName) return { state: 'alive', name: g.goodsName.slice(0, 20) };
+          const txt = (document.body.innerText || '').slice(0, 500);
+          if (/已下架|商品不存在|已售罄|停止销售|该商品已下架/.test(txt)) {
+            return { state: 'gone', note: '页面提示已下架' };
+          }
+          return { state: 'loading' };
+        },
+      });
+      if (!result || result.state === 'loading') continue;
+      if (result.state === 'alive') return { alive: true, note: result.name };
+      if (result.state === 'gone') return { alive: false, note: result.note };
+      if (result.state === 'need-login') {
+        return { alive: null, note: '拼多多未登录，无法核查' };
+      }
+    }
+    return { alive: null, note: '页面一直没加载出商品数据，无法判断' };
+  } catch (e) {
+    return { alive: null, note: String(e.message || e).slice(0, 40) };
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
   }
-  const m = html.match(/"goodsName"\s*:\s*"([^"]{1,40})/);
-  if (m) return { alive: true, note: m[1].slice(0, 20) };
-  if (/已下架|商品不存在|该商品已停止销售/.test(html)) {
-    return { alive: false, note: '页面显示已下架' };
-  }
-  // 登录了、也没报下架，却读不到商品名 → 多半是真没了
-  return { alive: false, note: '页面上读不到商品信息' };
 }
 
 async function runLinkCheck() {
