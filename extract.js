@@ -309,6 +309,41 @@
         qty: sk.quantity != null ? Number(sk.quantity) : null,
       })).filter(x => x.id && x.name);
 
+      // ---- 24 小时内发货 ----
+      // 无货源最怕拍下来卖家慢慢发：煤炉那边买家已经在等了，这边还没出货。
+      // 拼多多把发货承诺放在哪个字段各版本不一，与其猜字段名，不如两头都认：
+      // 商品数据里搜「N小时内发货」这种字符串，页面上也扫一遍短行。两处任一命中即可。
+      const SHIP_RE = /(\d+)\s*小时(?:内)?发货|当日发货|今日发货/;
+      let shipHit = '';
+      const scanShip = (o, d) => {
+        if (shipHit || !o || d > 4) return;
+        if (typeof o === 'string') { const m = o.length < 40 && o.match(SHIP_RE); if (m) shipHit = m[0]; return; }
+        if (typeof o !== 'object' || ArrayBuffer.isView(o)) return;
+        const lst = asList(o);
+        const keys = lst ? lst.slice(0, 30).map((_, i) => i) : Object.keys(o);
+        for (const k of keys) {
+          if (SKIP[k] || shipHit) return;
+          let v; try { v = o[k]; } catch (e) { continue; }
+          scanShip(v, d + 1);
+        }
+      };
+      scanShip(g, 0);
+      if (!shipHit) scanShip(init, 0);
+      if (!shipHit) {
+        // 页面上那个绿色角标和「24小时内发货 · 7天无理由退货」服务行。
+        // 必须出现在行首（最多让过「发货时间：」这种短前缀）——买家评价里
+        // 「这家店都是24小时内发货的」提一嘴，不是卖家的承诺。
+        for (const raw of str(document.body && document.body.innerText).split(String.fromCharCode(10))) {
+          const l = raw.trim();
+          if (!l || l.length >= 40) continue;
+          const m = l.match(SHIP_RE);
+          if (m && m.index <= 6) { shipHit = m[0]; break; }
+        }
+      }
+      // 「24小时内发货」「当日发货」算数；「48小时」「72小时」不算
+      const shipHours = shipHit ? Number((shipHit.match(/\d+/) || [24])[0]) : null;
+      const ship24 = shipHit ? (shipHours <= 24) : null;
+
       const mallBags = [init.mall, g.mall, init.mall_entrance && init.mall_entrance.mall_data,
                         init.mallEntrance && init.mallEntrance.mallData].filter(Boolean);
       // 下架标记：老页面/接口在商品下架后仍会带着完整的 goods 对象，光看「有商品名」会误判在售
@@ -327,6 +362,7 @@
         // 这些没必要跟着商品记录存一辈子，核查下架时也只需要商品号
         url: location.origin + location.pathname + '?goods_id=' + str(pick(g, ID) || urlId),
         skus, from: best.from,
+        ship24, ship24Note: shipHit,
         offSale: saleFlag === false,
         // 数据里明确标着在售，页面文字里碰巧出现「已下架」就不算数
         goneText: saleFlag === true ? '' : (goneText || str(g.statusExplain).slice(0, 20)),

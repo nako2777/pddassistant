@@ -186,7 +186,10 @@ async function checkOne(goodsId) {
         continue;
       }
       goneVotes = 0;
-      if (!r.err && r.name) return { alive: true, note: String(r.name).slice(0, 20) };
+      if (!r.err && r.name) {
+        return { alive: true, note: String(r.name).slice(0, 20),
+                 ship24: r.ship24, ship24Note: r.ship24Note || '' };
+      }
     }
     return { alive: null, note: goneVotes ? `只有一次迹象显示下架（${goneNote}），不够确定`
                                           : '页面一直没加载出商品数据，无法判断' };

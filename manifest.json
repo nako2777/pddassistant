@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "煤炉管理台 - 拼多多搬家",
   "description": "在拼多多商品页一键把商品推送到煤炉多账号管理台（自动翻译定价，发布到煤炉/雅虎）",
-  "version": "1.9.1",
+  "version": "1.10",
   "permissions": [
     "alarms",
     "scripting",
