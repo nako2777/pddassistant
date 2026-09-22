@@ -104,7 +104,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!goods || goods.err) {
         const why = { 'need-login': '拼多多没登录', 'no-data': '页面上没读到商品数据',
                       'no-extractor': '取数脚本没注入进去，刷新页面再试',
-                      'price-unit': '价格单位认不准，没推（推上去价格可能差一百倍）' };
+                      'price-unit': '价格单位认不准，没推（推上去价格可能差一百倍）',
+                      'loading': '页面数据还没加载完，等一两秒再点' };
         const p = goods && goods.probe;
         // 读不到的时候把现场带出来：找到了什么、试了哪几条路、页面上有哪些像数据的变量。
         // 靠这个才定位出「纯客户端渲染页 rawData=null」这个病因的。

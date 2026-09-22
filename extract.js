@@ -88,10 +88,37 @@
           layer = next;
         }
       };
-      const matched = () => cands.some(c => urlId && str(pick(c.g, ID)) === urlId && hasDetail(c));
+      const matched = () => cands.some(c => urlId && str(pick(c.g, ID)) === urlId && hasDetail(c) && hasPrice(c));
       const skuListOf = c => SKUS.map(k => asList(c.g[k])).concat(SKUS.map(k => asList(c.init[k]))).find(Boolean);
       // 「详情级」数据才算数：列表卡片只有名字、缩略图、价格，没有规格和相册
       const hasDetail = c => !!(skuListOf(c) || GALS.some(k => asList(c.g[k]) || asList(c.init[k])));
+      const PRICE_KEYS = ['minOnSaleGroupPriceInCent', 'minGroupPriceInCent',
+                          'minOnSaleGroupPrice', 'minGroupPrice', 'minOnSaleNormalPrice', 'minNormalPrice',
+                          'maxOnSaleGroupPrice', 'min_on_sale_group_price', 'min_group_price',
+                          'min_on_sale_normal_price', 'min_normal_price', 'max_on_sale_group_price'];
+      const SKU_PRICE_KEYS = ['groupPrice', 'group_price', 'normalPrice', 'normal_price', 'price', 'skuPrice'];
+      const toFen = (v, key) => {
+        const n = Number(v);
+        if (!(n > 0)) return 0;
+        if (/InCent$/.test(str(key))) return Math.round(n);
+        const yuan = typeof v === 'string' || n % 1 !== 0;
+        return Math.round(yuan ? n * 100 : n);
+      };
+      const skuFen = sk => { for (const k of SKU_PRICE_KEYS) { const f = toFen(sk && sk[k], k); if (f) return f; } return 0; };
+      const goodsFensOf = c => {
+        const out = [];
+        for (const bag of [c.g, c.init, c.init.price, c.g.price]) {
+          if (!bag || typeof bag !== 'object') continue;
+          for (const k of PRICE_KEYS) { const f = toFen(bag[k], k); if (f) out.push(f); }
+        }
+        return out;
+      };
+      // 价格全是 0 的不算数：拼多多服务端会先吐一副**预渲染骨架**
+      //（store.isPre / preRenderShowMock），商品名和 ID 是真的，但价格全 "0"、
+      // 店铺 null、相册只有 1 张，真数据随后才进 React 树。
+      // 早先只要「有商品、有规格数组」就收工，于是稳稳地抓到这副空壳。
+      const hasPrice = c => goodsFensOf(c).length > 0
+        || (skuListOf(c) || []).some(sk => skuFen(sk) > 0);
 
       // ---- 来源 1：全局变量（服务端渲染的老页面）----
       for (const k of ['rawData', '__INITIAL_STATE__', '__NEXT_DATA__', '__PRELOADED_STATE__']) {
@@ -184,13 +211,9 @@
       // 接口形状里 sku[] 是 goods 的兄弟节点，同一个父级下的任何同号摘要（分享信息之类）
       // 都能沾到 init.sku 的光。所以相册、价格、描述这些「长在自己身上」的才是硬证据，
       // 分不出高下就挑字段多的那个——摘要只有三五个字段，详情有几十个。
-      const PRICE_KEYS = ['minOnSaleGroupPriceInCent', 'minGroupPriceInCent',
-                          'minOnSaleGroupPrice', 'minGroupPrice', 'minOnSaleNormalPrice', 'minNormalPrice',
-                          'maxOnSaleGroupPrice', 'min_on_sale_group_price', 'min_group_price',
-                          'min_on_sale_normal_price', 'min_normal_price', 'max_on_sale_group_price'];
-      const score = c => (skuListOf(c) && skuListOf(c).length ? 100 : 0)
+      const score = c => (hasPrice(c) ? 500 : 0)
+        + (skuListOf(c) && skuListOf(c).length ? 100 : 0)
         + (GALS.some(k => asList(c.g[k])) ? 30 : 0)
-        + (PRICE_KEYS.some(k => Number(c.g[k]) > 0) ? 10 : 0)
         + (pick(c.g, ['goodsDesc', 'goods_desc']) ? 5 : 0)
         + Math.min(Object.keys(c.g).length, 60) / 100 - c.depth / 1000;
       // 地址栏有 goods_id 就必须对上；地址栏没有（极少见）才退而求其次
@@ -234,6 +257,16 @@
         };
       }
 
+      // 只找到骨架（价格全 0）= 真数据还在路上。报「还没加载完」比推一个 ¥0 的商品强，
+      // 也比含糊的「没读到商品数据」强——用户等一两秒再点就好。
+      if (!hasPrice(best)) {
+        return { err: 'loading', goneText,
+          probe: { url: location.href.slice(0, 120), title: str(document.title).slice(0, 40),
+            seen: '只读到页面骨架（商品名有、价格全是 0）：' + str(pick(best.g, NAME)).slice(0, 20),
+            tried: '内联脚本含商品名的 ' + tried.scripts + ' 个｜React:' + (tried.fiber || '没用上'),
+            stores: '' } };
+      }
+
       // ---- 统一字段：老页面是 camelCase，接口响应是 snake_case，两套都认 ----
       const g = best.g, init = best.init;
       const rawSkus = skuListOf(best) || [];
@@ -244,20 +277,7 @@
       //   · 键名以 InCent 结尾的 = 分，不管什么类型。
       // 同一件商品里「45.9 元」和「4760 分」确实会同时出现，整页统一换算必错一个；
       // 而只靠大小猜（<100 算元）会把 "128" 元当成 1.28 元，直接按地板价挂出去。
-      const SKU_PRICE_KEYS = ['groupPrice', 'group_price', 'normalPrice', 'normal_price', 'price', 'skuPrice'];
-      const toFen = (v, key) => {
-        const n = Number(v);
-        if (!(n > 0)) return 0;
-        if (/InCent$/.test(str(key))) return Math.round(n);
-        const yuan = typeof v === 'string' || n % 1 !== 0;
-        return Math.round(yuan ? n * 100 : n);
-      };
-      const goodsFens = [];
-      for (const bag of [g, init, init.price, g.price]) {
-        if (!bag || typeof bag !== 'object') continue;
-        for (const k of PRICE_KEYS) { const f = toFen(bag[k], k); if (f) goodsFens.push(f); }
-      }
-      const skuFen = sk => { for (const k of SKU_PRICE_KEYS) { const f = toFen(sk && sk[k], k); if (f) return f; } return 0; };
+      const goodsFens = goodsFensOf(best);
       const skuFens = rawSkus.map(skuFen).filter(Boolean);
       const cents = (goodsFens.length ? goodsFens : skuFens).reduce((a, b) => (a && a < b ? a : b), 0);
       // 验算：规格价和商品最低价差出两个数量级，只可能是单位认错了。
